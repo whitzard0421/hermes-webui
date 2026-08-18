@@ -11,16 +11,19 @@ import atexit
 import base64
 import copy
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit, urlunsplit
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -75,6 +78,118 @@ def _custom_provider_name_matches(provider_id: str, name: object) -> bool:
     if slug:
         candidates.add(slug)
     return pid in candidates
+
+
+_CUSTOM_PROVIDER_API_MODES = frozenset({
+    "openai_compatible", "chat_completions", "codex_responses", "anthropic_messages",
+})
+_CUSTOM_PROVIDER_ENV_PREFIX = "HERMES_WEBUI_CUSTOM_"
+
+
+def _custom_provider_env_var(provider_id: str) -> str:
+    """Return a deterministic, private env-var name for a managed provider."""
+    slug = provider_id.removeprefix("custom:")
+    safe = "".join(ch if ch.isalnum() else "_" for ch in slug.upper()).strip("_")
+    return f"{_CUSTOM_PROVIDER_ENV_PREFIX}{safe}_API_KEY"
+
+
+def _validate_managed_custom_provider(
+    name: object,
+    base_url: object,
+    api_mode: object,
+) -> tuple[str, str, str]:
+    """Validate public custom-provider metadata before it is persisted."""
+    display_name = str(name or "").strip()
+    provider_id = _custom_provider_slug_from_name(display_name)
+    if not display_name or not provider_id or len(display_name) > 80:
+        raise ValueError(
+            "Provider name must produce a non-empty identifier and be at most 80 characters."
+        )
+    if provider_id.count(":") != 1 or len(provider_id) > 72:
+        raise ValueError("Provider name is not valid.")
+
+    raw_url = str(base_url or "").strip()
+    parsed = urlsplit(raw_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Base URL must be an absolute http:// or https:// URL.")
+    if parsed.username or parsed.password or parsed.fragment or parsed.query:
+        raise ValueError(
+            "Base URL must not contain credentials, a query string, or a fragment."
+        )
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Base URL has an invalid port.") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("Base URL has an invalid port.")
+    try:
+        resolved = socket.getaddrinfo(
+            parsed.hostname,
+            port or (443 if parsed.scheme == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise ValueError("Base URL host could not be resolved.") from exc
+    for _family, _type, _proto, _canonname, sockaddr in resolved:
+        address = ipaddress.ip_address(sockaddr[0])
+        if any((
+            address.is_private,
+            address.is_loopback,
+            address.is_link_local,
+            address.is_multicast,
+            address.is_reserved,
+            address.is_unspecified,
+        )):
+            raise ValueError("Base URL must resolve to a public address.")
+
+    mode = str(api_mode or "openai_compatible").strip().lower()
+    if mode not in _CUSTOM_PROVIDER_API_MODES:
+        raise ValueError("Unsupported API mode.")
+    normalized_url = urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "")
+    )
+    return provider_id, normalized_url, mode
+
+
+def probe_custom_provider_models(payload: dict[str, Any]) -> dict[str, Any]:
+    """Fetch a bounded model catalog without persisting the supplied details."""
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "Provider details are required."}
+    try:
+        _provider_id, base_url, _mode = _validate_managed_custom_provider(
+            payload.get("name") or "probe",
+            payload.get("base_url"),
+            payload.get("api_mode"),
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    api_key = str(payload.get("api_key") or "").strip() or None
+    if api_key and ("\n" in api_key or "\r" in api_key):
+        return {"ok": False, "error": "API key must not contain newline characters."}
+    try:
+        from api.onboarding import probe_provider_endpoint
+
+        result = probe_provider_endpoint("custom", base_url, api_key)
+    except Exception:
+        logger.exception("Custom provider model probe failed")
+        return {"ok": False, "error": "Model discovery failed."}
+    if not result.get("ok"):
+        return {
+            "ok": False,
+            "error": result.get("error", "unreachable"),
+            "detail": result.get("detail", ""),
+        }
+    models: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in result.get("models", []):
+        model_id = str(item.get("id") if isinstance(item, dict) else item).strip()
+        if model_id and model_id not in seen:
+            seen.add(model_id)
+            models.append({"id": model_id, "label": model_id})
+        if len(models) >= 100:
+            break
+    return {"ok": True, "models": models}
+
 
 _OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
 _PROVIDER_QUOTA_TIMEOUT_SECONDS = 3.0
@@ -2561,6 +2676,7 @@ def get_providers() -> dict[str, Any]:
     # Collect all known provider IDs from multiple sources
     known_ids = set(_PROVIDER_DISPLAY.keys()) | set(_PROVIDER_MODELS.keys())
     known_ids.update(plugin_model_provider_ids())
+    builtin_or_plugin_ids = set(known_ids)
 
     # Also detect providers from config.yaml providers section
     cfg = get_config()
@@ -2571,13 +2687,23 @@ def get_providers() -> dict[str, Any]:
 
     providers = []
     providers_cfg = cfg.get("providers") or {}
+    named_provider_entries: dict[str, dict[str, Any]] = {}
     if isinstance(providers_cfg, dict):
         known_ids.update(providers_cfg.keys())
+        # Named endpoints in providers.<name> route as custom:<name>. Keep
+        # built-ins in the normal loop and expose only genuinely custom names.
+        named_provider_entries = {
+            str(name): entry
+            for name, entry in providers_cfg.items()
+            if isinstance(entry, dict) and str(name) not in builtin_or_plugin_ids
+        }
 
     # Add OAuth providers even if not in _PROVIDER_DISPLAY
     known_ids.update(_OAUTH_PROVIDERS)
 
     for pid in sorted(known_ids):
+        if pid in named_provider_entries:
+            continue
         display_name = effective_provider_display_name(pid, _PROVIDER_DISPLAY)
         is_oauth = _provider_is_oauth(pid)
         has_key = _provider_has_key(pid)
@@ -2850,9 +2976,13 @@ def get_providers() -> dict[str, Any]:
                 if _mid not in cp_model_ids:
                     cp_model_ids.append(_mid)
             cp_models = [{"id": mid, "label": mid} for mid in cp_model_ids]
-            # Check for env var reference (${VAR_NAME} pattern)
+            # Managed entries reference secrets by key_env; hand-authored
+            # entries may still use the older ${VAR_NAME} form.
             cp_api_key = str(cp.get("api_key") or "")
             cp_has_key = bool(cp_api_key.strip())
+            cp_key_env = str(cp.get("key_env") or "").strip()
+            if cp_key_env:
+                cp_has_key = bool(_thread_local_env_value(cp_key_env).strip())
             # Replace env var reference to check actual value
             if cp_api_key.startswith("${") and cp_api_key.endswith("}"):
                 env_var = cp_api_key[2:-1]
@@ -2869,12 +2999,70 @@ def get_providers() -> dict[str, Any]:
                 "id": cp_id,
                 "display_name": cp_name,
                 "has_key": cp_has_key,
-                "configurable": False,  # custom providers managed via config.yaml
+                "configurable": False,
+                "editable": True,
                 "is_custom": True,
                 "key_source": "config_yaml" if cp_has_key else "none",
+                "base_url": str(cp.get("base_url") or "").strip(),
+                "api_mode": str(cp.get("api_mode") or "openai_compatible").strip(),
+                "default_model": str(cp.get("model") or "").strip(),
+                "discover_models": bool(cp.get("discover_models")),
+                "context_length": cp.get("context_length"),
                 "models": cp_models,
                 "models_total": len(cp_models),
             })
+
+    # Newer Hermes configs may use providers.<name> for custom endpoints.
+    # Preserve that schema while exposing the same editable WebUI contract.
+    existing_custom_ids = {str(item.get("id") or "") for item in providers}
+    env_values = _load_env_file(_get_hermes_home() / ".env")
+    for entry_name, entry in named_provider_entries.items():
+        provider_id = _custom_provider_slug_from_name(entry_name)
+        if not provider_id or provider_id in existing_custom_ids:
+            continue
+        key_env = str(entry.get("key_env") or "").strip()
+        has_key = bool(
+            key_env
+            and (env_values.get(key_env) or _thread_local_env_value(key_env)).strip()
+        )
+        raw_key = str(entry.get("api_key") or "").strip()
+        if raw_key.startswith("${") and raw_key.endswith("}"):
+            has_key = bool(_thread_local_env_value(raw_key[2:-1]).strip())
+        elif raw_key:
+            has_key = True
+
+        default_model = str(
+            entry.get("default_model") or entry.get("model") or ""
+        ).strip()
+        model_ids: list[str] = []
+        if default_model:
+            model_ids.append(default_model)
+        for model_id in _configured_model_ids(entry.get("models")):
+            if model_id not in model_ids:
+                model_ids.append(model_id)
+        models = [{"id": model_id, "label": model_id} for model_id in model_ids]
+
+        providers.append({
+            "id": provider_id,
+            "display_name": entry_name,
+            "has_key": has_key,
+            "configurable": False,
+            "editable": True,
+            "is_custom": True,
+            "config_source": "providers",
+            "key_source": "config_yaml" if has_key else "none",
+            "base_url": str(entry.get("base_url") or entry.get("api") or "").strip(),
+            "api_mode": str(
+                entry.get("api_mode")
+                or entry.get("transport")
+                or "openai_compatible"
+            ).strip(),
+            "default_model": default_model,
+            "discover_models": bool(entry.get("discover_models")),
+            "context_length": entry.get("context_length"),
+            "models": models,
+            "models_total": len(models),
+        })
 
     # Determine active provider
     active_provider = None
@@ -2980,6 +3168,328 @@ def remove_provider_key(provider_id: str) -> dict[str, Any]:
         _clean_provider_key_from_config(provider_id)
 
     return result
+
+
+def save_custom_provider(payload: dict[str, Any]) -> dict[str, Any]:
+    """Create or update a WebUI-managed named custom provider."""
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "Provider details are required."}
+    try:
+        provider_id, base_url, api_mode = _validate_managed_custom_provider(
+            payload.get("name"), payload.get("base_url"), payload.get("api_mode")
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    if str(payload.get("name") or "").strip().lower().startswith("custom:"):
+        return {"ok": False, "error": "Provider name must not begin with 'custom:'."}
+
+    model = str(payload.get("model") or "").strip()
+    if not model or len(model) > 200 or "\n" in model or "\r" in model:
+        return {"ok": False, "error": "A valid default model is required."}
+
+    requested_id = str(payload.get("provider") or "").strip().lower()
+    if requested_id and requested_id != provider_id:
+        return {
+            "ok": False,
+            "error": "Provider names cannot be changed after creation.",
+        }
+    if requested_id and not requested_id.startswith("custom:"):
+        return {"ok": False, "error": "Only custom providers can be edited here."}
+
+    key_present = "api_key" in payload
+    api_key = str(payload.get("api_key") or "").strip() if key_present else None
+    if api_key and ("\n" in api_key or "\r" in api_key or len(api_key) < 8):
+        return {"ok": False, "error": "API key is invalid."}
+    clear_key = bool(payload.get("clear_api_key"))
+    if clear_key and api_key:
+        return {"ok": False, "error": "Provide an API key or clear it, not both."}
+
+    try:
+        context_length = payload.get("context_length")
+        if context_length in (None, ""):
+            context_length = None
+        else:
+            context_length = int(context_length)
+            if not 256 <= context_length <= 10_000_000:
+                raise ValueError
+    except (TypeError, ValueError):
+        return {
+            "ok": False,
+            "error": "Context length must be between 256 and 10000000.",
+        }
+
+    import api.config as _config
+    import yaml as _yaml
+
+    config_path = _config._get_config_path()
+    env_updates: dict[str, str | None] = {}
+    config_source = str(payload.get("config_source") or "custom_providers")
+    if config_source not in {"custom_providers", "providers"}:
+        return {
+            "ok": False,
+            "error": "Unknown custom provider configuration source.",
+        }
+
+    try:
+        with _config._cfg_lock:
+            if config_path.exists():
+                loaded = _yaml.safe_load(config_path.read_text(encoding="utf-8"))
+                config_data = loaded if isinstance(loaded, dict) else {}
+            else:
+                config_data = {}
+
+            creating = not requested_id
+            entry_key: str | int | None = None
+            if config_source == "providers":
+                if creating:
+                    return {
+                        "ok": False,
+                        "error": "New providers must use the custom provider list.",
+                    }
+                providers_section = config_data.get("providers")
+                if not isinstance(providers_section, dict):
+                    return {"ok": False, "error": "Named provider was not found."}
+                matching_keys = [
+                    str(key)
+                    for key, value in providers_section.items()
+                    if isinstance(value, dict)
+                    and _custom_provider_slug_from_name(key) == provider_id
+                ]
+                if len(matching_keys) != 1:
+                    return {
+                        "ok": False,
+                        "error": "Named provider was not found or is duplicated.",
+                    }
+                entry_key = matching_keys[0]
+                entry = dict(providers_section[entry_key])
+                url_field = (
+                    "api" if "api" in entry and "base_url" not in entry else "base_url"
+                )
+                mode_field = (
+                    "transport"
+                    if "transport" in entry and "api_mode" not in entry
+                    else "api_mode"
+                )
+                model_field = "default_model" if "default_model" in entry else "model"
+                entry[url_field] = base_url
+                entry[mode_field] = api_mode
+                entry[model_field] = model
+            else:
+                entries = config_data.get("custom_providers")
+                if entries is None:
+                    entries = []
+                    config_data["custom_providers"] = entries
+                if not isinstance(entries, list):
+                    return {
+                        "ok": False,
+                        "error": "custom_providers must be a list in config.yaml.",
+                    }
+                matching = [
+                    index
+                    for index, candidate in enumerate(entries)
+                    if isinstance(candidate, dict)
+                    and _custom_provider_slug_from_name(candidate.get("name"))
+                    == provider_id
+                ]
+                if len(matching) > 1:
+                    return {
+                        "ok": False,
+                        "error": "Duplicate custom provider identifiers exist in config.yaml.",
+                    }
+                if creating and matching:
+                    return {
+                        "ok": False,
+                        "error": "A provider with this name already exists.",
+                    }
+                if not creating and not matching:
+                    return {"ok": False, "error": "Custom provider was not found."}
+                entry_key = matching[0] if matching else None
+                entry = dict(entries[entry_key]) if entry_key is not None else {}
+                entry.update({
+                    "name": str(payload["name"]).strip(),
+                    "base_url": base_url,
+                    "api_mode": api_mode,
+                    "model": model,
+                })
+
+            if "discover_models" in payload:
+                entry["discover_models"] = bool(payload.get("discover_models"))
+            if context_length is None:
+                entry.pop("context_length", None)
+            else:
+                entry["context_length"] = context_length
+
+            managed_env = _custom_provider_env_var(provider_id)
+            old_key_env = str(entry.get("key_env") or "")
+            if api_key:
+                entry.pop("api_key", None)
+                entry["key_env"] = managed_env
+                env_updates[managed_env] = api_key
+                if (
+                    old_key_env.startswith(_CUSTOM_PROVIDER_ENV_PREFIX)
+                    and old_key_env != managed_env
+                ):
+                    env_updates[old_key_env] = None
+            elif clear_key:
+                entry.pop("api_key", None)
+                entry.pop("key_env", None)
+                if old_key_env.startswith(_CUSTOM_PROVIDER_ENV_PREFIX):
+                    env_updates[old_key_env] = None
+
+            if config_source == "providers":
+                providers_section[entry_key] = entry
+            elif entry_key is not None:
+                entries[entry_key] = entry
+            else:
+                entries.append(entry)
+            _save_yaml_config_file(config_path, config_data)
+    except Exception as exc:
+        logger.exception("Failed to save custom provider %s", provider_id)
+        return {"ok": False, "error": f"Failed to save provider: {exc}"}
+
+    try:
+        if env_updates:
+            _write_env_file(_get_hermes_home() / ".env", env_updates)
+    except Exception as exc:
+        logger.exception(
+            "Saved custom provider metadata but could not write its API key"
+        )
+        return {
+            "ok": False,
+            "error": f"Provider metadata was saved but API key update failed: {exc}",
+        }
+
+    reload_config()
+    invalidate_models_cache()
+    invalidate_providers_cache()
+    return {
+        "ok": True,
+        "provider": provider_id,
+        "action": "created" if not requested_id else "updated",
+    }
+
+
+def delete_custom_provider(
+    provider_id: str,
+    config_source: object = None,
+) -> dict[str, Any]:
+    """Delete an unused named custom provider and its managed API key."""
+    provider_id = str(provider_id or "").strip().lower()
+    if not provider_id.startswith("custom:"):
+        return {"ok": False, "error": "A custom provider identifier is required."}
+
+    import api.config as _config
+    import yaml as _yaml
+
+    config_path = _config._get_config_path()
+    source = str(config_source or "custom_providers")
+    if source not in {"custom_providers", "providers"}:
+        return {
+            "ok": False,
+            "error": "Unknown custom provider configuration source.",
+        }
+    old_key_env = ""
+    try:
+        with _config._cfg_lock:
+            if not config_path.exists():
+                return {"ok": False, "error": "Custom provider was not found."}
+            loaded = _yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            config_data = loaded if isinstance(loaded, dict) else {}
+
+            if source == "providers":
+                provider_map = config_data.get("providers")
+                if not isinstance(provider_map, dict):
+                    return {"ok": False, "error": "Custom provider was not found."}
+                matching_keys = [
+                    str(key)
+                    for key, entry in provider_map.items()
+                    if isinstance(entry, dict)
+                    and _custom_provider_slug_from_name(key) == provider_id
+                ]
+                if len(matching_keys) != 1:
+                    return {
+                        "ok": False,
+                        "error": "Custom provider was not found or is duplicated.",
+                    }
+                entry = provider_map[matching_keys[0]]
+                remaining = {
+                    key: value
+                    for key, value in provider_map.items()
+                    if str(key) != matching_keys[0]
+                }
+                references = dict(config_data)
+                references["providers"] = remaining
+            else:
+                entries = config_data.get("custom_providers")
+                if not isinstance(entries, list):
+                    return {"ok": False, "error": "Custom provider was not found."}
+                matches = [
+                    item
+                    for item in entries
+                    if isinstance(item, dict)
+                    and _custom_provider_slug_from_name(item.get("name"))
+                    == provider_id
+                ]
+                if len(matches) != 1:
+                    return {
+                        "ok": False,
+                        "error": "Custom provider was not found or is duplicated.",
+                    }
+                entry = matches[0]
+                remaining = [item for item in entries if item is not entry]
+                references = dict(config_data)
+                references["custom_providers"] = remaining
+
+            model_cfg = references.get("model")
+            if (
+                isinstance(model_cfg, dict)
+                and str(model_cfg.get("provider") or "").strip().lower()
+                == provider_id
+            ):
+                return {
+                    "ok": False,
+                    "error": (
+                        "This provider is the active default model provider and "
+                        "cannot be deleted."
+                    ),
+                }
+
+            def _mentions(value: object) -> bool:
+                if isinstance(value, dict):
+                    return any(_mentions(item) for item in value.values())
+                if isinstance(value, list):
+                    return any(_mentions(item) for item in value)
+                return (
+                    isinstance(value, str)
+                    and value.strip().lower() == provider_id
+                )
+
+            if _mentions(references):
+                return {
+                    "ok": False,
+                    "error": (
+                        "This provider is referenced by another configuration "
+                        "setting and cannot be deleted."
+                    ),
+                }
+            old_key_env = str(entry.get("key_env") or "")
+            config_data[source] = remaining
+            _save_yaml_config_file(config_path, config_data)
+    except Exception as exc:
+        logger.exception("Failed to delete custom provider %s", provider_id)
+        return {"ok": False, "error": f"Failed to delete provider: {exc}"}
+
+    if old_key_env.startswith(_CUSTOM_PROVIDER_ENV_PREFIX):
+        try:
+            _write_env_file(_get_hermes_home() / ".env", {old_key_env: None})
+        except Exception:
+            logger.exception(
+                "Deleted custom provider but could not remove managed API key"
+            )
+    reload_config()
+    invalidate_models_cache()
+    invalidate_providers_cache()
+    return {"ok": True, "provider": provider_id, "action": "deleted"}
 
 
 def _clean_provider_key_from_config(provider_id: str) -> None:

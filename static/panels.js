@@ -10913,12 +10913,10 @@ async function loadProvidersPanel(){
       renderProviderCostChart(quotaCard); // async, fire-and-forget
     }
     if(providers.length===0){
-      list.style.display='none';
       if(empty) empty.style.display='';
-      return;
-    }
-    if(empty) empty.style.display='none';
+    }else if(empty) empty.style.display='none';
     list.style.display='';
+    list.appendChild(_buildCustomProviderCard(null));
     for(const p of providers){
       list.appendChild(_buildProviderCard(p));
     }
@@ -11318,6 +11316,101 @@ function _attachBudgetControls(wrap,history,card,paceNum){
   });
 }
 
+function _buildCustomProviderCard(p){
+  const isEdit=!!p;
+  const card=document.createElement('div');
+  card.className='provider-card'+(isEdit?'':' open');
+  if(isEdit) card.dataset.provider=p.id;
+  const header=document.createElement(isEdit?'button':'div');
+  if(isEdit){
+    header.type='button';
+    header.className='provider-card-header';
+    header.innerHTML=`<div class="provider-card-info"><div class="provider-card-name">${esc(p.display_name)}</div><div class="provider-card-meta">Custom provider</div></div><svg class="provider-card-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" width="16" height="16"><path d="M6 9l6 6 6-6"/></svg>`;
+  }else{
+    header.className='provider-card-header';
+    header.innerHTML='<div class="provider-card-info"><div class="provider-card-name">Add custom provider</div><div class="provider-card-meta">OpenAI-compatible, Codex Responses, or Anthropic Messages</div></div>';
+  }
+  card.appendChild(header);
+  const body=document.createElement('div');
+  body.className='provider-card-body';
+  const field=(label,value='',type='text')=>{
+    const wrap=document.createElement('div'); wrap.className='provider-card-field';
+    const lab=document.createElement('label'); lab.className='provider-card-label'; lab.textContent=label;
+    const input=document.createElement('input'); input.type=type; input.className='provider-card-input'; input.value=value; input.autocomplete='off';
+    wrap.append(lab,input); body.appendChild(wrap); return input;
+  };
+  const name=field('Name',isEdit?p.display_name:'');
+  name.placeholder='My provider';
+  if(isEdit) name.disabled=true;
+  const baseUrl=field('Base URL',isEdit?(p.base_url||''):'');
+  baseUrl.placeholder='https://api.example.com/v1';
+  const modeWrap=document.createElement('div'); modeWrap.className='provider-card-field';
+  const modeLabel=document.createElement('label'); modeLabel.className='provider-card-label'; modeLabel.textContent='API mode';
+  const mode=document.createElement('select'); mode.className='provider-card-input';
+  [['openai_compatible','OpenAI compatible'],['chat_completions','Chat completions'],['codex_responses','Codex Responses'],['anthropic_messages','Anthropic Messages']].forEach(([value,label])=>{const option=document.createElement('option'); option.value=value; option.textContent=label; mode.appendChild(option);});
+  mode.value=isEdit?(p.api_mode||'openai_compatible'):'openai_compatible'; modeWrap.append(modeLabel,mode); body.appendChild(modeWrap);
+  const model=field('Default model',isEdit?(p.default_model||((p.models||[])[0]||{}).id||''):'');
+  model.placeholder='model-id';
+  const modelList=document.createElement('datalist'); modelList.id='custom-provider-models-'+(isEdit?p.id.replace(/[^a-z0-9_-]/gi,'-'):'new');
+  model.setAttribute('list',modelList.id); body.appendChild(modelList);
+  const apiKey=field(isEdit?'API key (leave empty to keep current key)':'API key (optional)','','password');
+  apiKey.placeholder='Optional';
+  // These credentials are API keys, not website passwords. Suppress password-manager autofill.
+  apiKey.autocomplete='new-password';
+  apiKey.name='custom-provider-credential';
+  apiKey.setAttribute('data-lpignore','true');
+  apiKey.setAttribute('data-1p-ignore','true');
+  apiKey.setAttribute('data-bwignore','true');
+  apiKey.spellcheck=false;
+  apiKey.autocapitalize='off';
+  const probeRow=document.createElement('div'); probeRow.className='provider-card-row';
+  const probe=document.createElement('button'); probe.type='button'; probe.className='provider-card-btn provider-card-btn-ghost'; probe.textContent='Fetch models';
+  const probeStatus=document.createElement('div'); probeStatus.className='provider-card-hint';
+  probeRow.append(probe); body.append(probeRow,probeStatus);
+  probe.onclick=async()=>{
+    const request={name:name.value.trim()||'probe',base_url:baseUrl.value.trim(),api_mode:mode.value};
+    const key=apiKey.value.trim(); if(key) request.api_key=key;
+    if(!request.base_url){showToast('Base URL is required');return;}
+    probe.disabled=true; const old=probe.textContent; probe.textContent='Fetching...'; probeStatus.textContent='Contacting upstream models endpoint...'; probeStatus.style.color='var(--muted)';
+    try{
+      const res=await api('/api/providers/custom/probe',{method:'POST',body:JSON.stringify(request)});
+      if(res&&res.ok){
+        const models=Array.isArray(res.models)?res.models:[]; modelList.innerHTML='';
+        models.forEach(item=>{const option=document.createElement('option');option.value=item.id||item;modelList.appendChild(option);});
+        if(!model.value&&models.length)model.value=models[0].id||models[0];
+        probeStatus.style.color='var(--ok)'; probeStatus.textContent=`Found ${models.length} model(s).`;
+      }else{
+        probeStatus.style.color='var(--accent)'; probeStatus.textContent=(res&&res.detail)||(res&&res.error)||'Model discovery failed'; showToast('Model discovery failed');
+      }
+    }catch(e){probeStatus.style.color='var(--accent)'; probeStatus.textContent=(e&&e.message)||'Model discovery failed'; showToast('Model discovery failed');}
+    finally{probe.disabled=false;probe.textContent=old;}
+  };
+  const discoverWrap=document.createElement('label'); discoverWrap.className='provider-card-hint';
+  const discover=document.createElement('input'); discover.type='checkbox'; discover.checked=isEdit?!!p.discover_models:true;
+  discoverWrap.append(discover,document.createTextNode(' Discover models automatically')); body.appendChild(discoverWrap);
+  const context=field('Context length (optional)',isEdit?(p.context_length||''):'','number'); context.min='256'; context.max='10000000';
+  const row=document.createElement('div'); row.className='provider-card-row'; row.style.marginTop='6px';
+  const save=document.createElement('button'); save.type='button'; save.className='provider-card-btn provider-card-btn-primary'; save.textContent=t('providers_save')||'Save';
+  const payload=()=>{const value={name:name.value.trim(),base_url:baseUrl.value.trim(),api_mode:mode.value,model:model.value.trim(),discover_models:discover.checked,context_length:context.value.trim()}; if(isEdit){value.provider=p.id;if(p.config_source)value.config_source=p.config_source;} const key=apiKey.value.trim(); if(key) value.api_key=key; return value;};
+  save.onclick=async()=>{
+    const request=payload(); if(!request.name||!request.base_url||!request.model){showToast('Name, Base URL, and default model are required');return;}
+    save.disabled=true; const old=save.textContent; save.textContent=t('providers_saving')||'Saving...';
+    try{const res=await api('/api/providers/custom',{method:'POST',body:JSON.stringify(request)}); if(res&&res.ok){showToast('Custom provider '+res.action); _refreshModelDropdownsAfterProviderChange(); await loadProvidersPanel();}else{showToast(res&&res.error||'Failed to save custom provider'); save.disabled=false; save.textContent=old;}}catch(e){showToast('Error: '+(e&&e.message||'Failed to save custom provider'));save.disabled=false;save.textContent=old;}
+  };
+  row.appendChild(save);
+  if(isEdit&&p.has_key){
+    const clear=document.createElement('button'); clear.type='button'; clear.className='provider-card-btn provider-card-btn-ghost'; clear.textContent='Remove key';
+    clear.onclick=async()=>{try{const res=await api('/api/providers/custom',{method:'POST',body:JSON.stringify({...payload(),clear_api_key:true})});if(res&&res.ok){showToast('Custom provider key removed');await loadProvidersPanel();}else showToast(res&&res.error||'Failed to remove key');}catch(e){showToast('Error: '+(e&&e.message||'Failed to remove key'));}}; row.appendChild(clear);
+  }
+  if(isEdit){
+    const remove=document.createElement('button'); remove.type='button'; remove.className='provider-card-btn provider-card-btn-danger'; remove.textContent='Delete';
+    remove.onclick=async()=>{if(!confirm('Delete this custom provider?'))return; try{const res=await api('/api/providers/custom/delete',{method:'POST',body:JSON.stringify({provider:p.id,config_source:p.config_source})});if(res&&res.ok){showToast('Custom provider deleted');_refreshModelDropdownsAfterProviderChange();await loadProvidersPanel();}else showToast(res&&res.error||'Failed to delete custom provider');}catch(e){showToast('Error: '+(e&&e.message||'Failed to delete custom provider'));}}; row.appendChild(remove);
+  }
+  body.appendChild(row); card.appendChild(body);
+  if(isEdit) header.addEventListener('click',()=>card.classList.toggle('open'));
+  return card;
+}
+
 function _buildProviderCard(p){
   const card=document.createElement('div');
   card.className='provider-card';
@@ -11358,6 +11451,10 @@ function _buildProviderCard(p){
 
   const body=document.createElement('div');
   body.className='provider-card-body';
+
+  if(p.is_custom){
+    return _buildCustomProviderCard(p);
+  }
 
   if(isOauth){
     const hint=document.createElement('div');

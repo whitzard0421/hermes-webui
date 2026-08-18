@@ -9900,6 +9900,9 @@ from api.providers import (
     provider_has_process_wakeup_recovery_credential,
     set_provider_key,
     remove_provider_key,
+    save_custom_provider,
+    delete_custom_provider,
+    probe_custom_provider_models,
 )
 from api.onboarding import (
     apply_onboarding_setup,
@@ -14749,6 +14752,27 @@ def handle_post(handler, parsed) -> bool:
         result = remove_provider_key(provider_id)
         if not result.get("ok"):
             return bad(handler, result.get("error", "Unknown error"))
+        return j(handler, result)
+
+    if parsed.path == "/api/providers/custom":
+        result = save_custom_provider(body)
+        if not result.get("ok"):
+            return bad(handler, result.get("error", "Unknown error"))
+        return j(handler, result)
+
+    if parsed.path == "/api/providers/custom/delete":
+        result = delete_custom_provider(
+            (body or {}).get("provider"),
+            (body or {}).get("config_source"),
+        )
+        if not result.get("ok"):
+            return bad(handler, result.get("error", "Unknown error"))
+        return j(handler, result)
+
+    if parsed.path == "/api/providers/custom/probe":
+        result = probe_custom_provider_models(body)
+        if not result.get("ok"):
+            return bad(handler, result.get("error", "Model discovery failed"))
         return j(handler, result)
 
     if parsed.path == "/api/providers/self-hosted":

@@ -88,9 +88,8 @@ class TestCustomProvidersInGetProviders:
             assert glmcode["has_key"] is True, (
                 "glmcode should detect key from ${GLMCODE_API_KEY} env var"
             )
-            assert glmcode["configurable"] is False, (
-                "custom providers should not be configurable via WebUI"
-            )
+            assert glmcode["configurable"] is False
+            assert glmcode["editable"] is True
             assert glmcode["is_custom"] is True
             assert glmcode["key_source"] == "config_yaml"
             assert glmcode["display_name"] == "glmcode"
@@ -104,12 +103,16 @@ class TestCustomProvidersInGetProviders:
         finally:
             self._restore_cfg(old_cfg, old_mtime)
 
-    def test_providers_panel_renders_config_yaml_custom_providers(self):
-        """Settings → Providers must not filter out read-only custom providers."""
+    def test_providers_panel_renders_editable_custom_providers(self):
+        """Settings → Providers must expose custom-provider CRUD controls."""
         src = open("static/panels.js", encoding="utf-8").read()
         assert "filter(p=>p.configurable||p.is_oauth||p.is_custom||p.is_plugin_provider||p.is_self_hosted)" in src
-        assert "Custom provider loaded from config.yaml / hermes model" in src
-        assert "if(p.configurable){" in src
+        assert "_buildCustomProviderCard(null)" in src
+        assert "/api/providers/custom" in src
+        assert "/api/providers/custom/delete" in src
+        assert "apiKey.autocomplete='new-password'" in src
+        assert "apiKey.setAttribute('data-lpignore','true')" in src
+        assert "apiKey.setAttribute('data-1p-ignore','true')" in src
 
     def test_custom_provider_with_multi_models(self, monkeypatch, tmp_path):
         """Custom provider with `models` list should expose all entries."""
