@@ -88,6 +88,7 @@ def _extract_function(source: str, name: str) -> str:
 
 
 LOAD_SESSION_SRC = _extract_function(SESSIONS_SRC, "loadSession")
+REQUEST_SESSION_MESSAGES_SRC = _extract_function(SESSIONS_SRC, "_requestSessionMessages")
 ENSURE_MESSAGES_LOADED_SRC = _extract_function(SESSIONS_SRC, "_ensureMessagesLoaded")
 INFLIGHT_HAS_VISIBLE_STATE_SRC = _extract_function(SESSIONS_SRC, "_inflightHasVisibleLiveState")
 SELECT_LIVE_RECOVERY_INFLIGHT_SRC = _extract_function(SESSIONS_SRC, "_selectLiveRecoveryInflight")
@@ -118,9 +119,15 @@ def test_loadsession_has_generation_token_and_forwards_to_ensure_messages_loaded
         "loadSession() should check ownership in multiple await/catch paths, "
         "including stale _ensureMessagesLoaded catch branches"
     )
-    ensure_call = _normalise_ws("await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration});")
-    assert ensure_call in norm, (
-        "loadSession() must pass generation into _ensureMessagesLoaded() for stale-owner checks"
+    assert norm.count("prefetchedMessagesOutcome:_prefetchedMessagesOutcome") == 2, (
+        "both active and idle paths must consume the single prefetched transcript result"
+    )
+    metadata_start = body.index("const _metadataRequest=api(")
+    message_start = body.index("_prefetchedMessagesOutcome=_requestSessionMessages(sid)")
+    metadata_await = body.index("data = await _metadataRequest")
+    assert metadata_start < message_start < metadata_await, (
+        "session metadata must start first, then the transcript request must start before "
+        "the metadata round trip completes"
     )
     assert (
         "showToast('Failed to load session" in LOAD_SESSION_SRC
@@ -351,6 +358,7 @@ __INFLIGHT_HAS_VISIBLE_STATE_SRC__
 __SELECT_LIVE_RECOVERY_INFLIGHT_SRC__
 __MERGE_PENDING_SESSION_MESSAGE_SRC__
 __LOAD_SESSION_SRC__
+__REQUEST_SESSION_MESSAGES_SRC__
 __ENSURE_MESSAGES_LOADED_SRC__
 
 async function waitForQueued(apiHost, url) {
@@ -461,11 +469,21 @@ function runCrossSessionOrderingBase({seedBeaconInflight, resolveBeaconMsgsBefor
 
   const first = loadSession('sid-beacon', { force: true });
   return (async () => {
+    // 让草稿保存 continuation 运行，但保持元数据未解析；此时 transcript
+    // 请求应已在途，不能再被另一条网络往返阻塞。
+    await Promise.resolve();
+    const beaconMessagesStartedBeforeMetadata = apiHost.pending.some(
+      (entry) => entry.url === calls.beaconMsgs.url
+    );
     await waitForQueued(apiHost, calls.beaconMeta.url);
     calls.beaconMeta._resolve(API_BEACON_META);
 
     await waitForQueued(apiHost, calls.beaconMsgs.url);
     const second = loadSession('sid-atlas', { force: true });
+    await Promise.resolve();
+    const atlasMessagesStartedBeforeMetadata = apiHost.pending.some(
+      (entry) => entry.url === calls.atlasMsgs.url
+    );
     await waitForQueued(apiHost, calls.atlasMeta.url);
 
     if (resolveBeaconMsgsBeforeAtlasMeta) {
@@ -496,6 +514,8 @@ function runCrossSessionOrderingBase({seedBeaconInflight, resolveBeaconMsgsBefor
       loadingSid: snapshotState().loadingSid,
       loadingGeneration: snapshotState().loadingGeneration,
       rearmCalls: snapshotState().rearmCalls,
+      beaconMessagesStartedBeforeMetadata,
+      atlasMessagesStartedBeforeMetadata,
     };
   })();
 }
@@ -609,6 +629,7 @@ def test_loadsession_cross_session_ordering_and_stale_reject_behavior(tmp_path):
             "__MERGE_PENDING_SESSION_MESSAGE_SRC__", MERGE_PENDING_SESSION_MESSAGE_SRC
         )
         .replace("__LOAD_SESSION_SRC__", LOAD_SESSION_SRC)
+        .replace("__REQUEST_SESSION_MESSAGES_SRC__", REQUEST_SESSION_MESSAGES_SRC)
         .replace("__ENSURE_MESSAGES_LOADED_SRC__", ENSURE_MESSAGES_LOADED_SRC)
     )
     body = _run_node(script, tmp_path)
@@ -616,6 +637,14 @@ def test_loadsession_cross_session_ordering_and_stale_reject_behavior(tmp_path):
     cross = body["crossSessionOrdering"]
     stale = body["staleIdleCatch"]
     observed = body["observedIdleCrossSessionOrdering"]
+
+    assert cross["beaconMessagesStartedBeforeMetadata"] is True, (
+        "Beacon transcript request must start before its metadata response to avoid "
+        "serializing two browser-to-server round trips"
+    )
+    assert cross["atlasMessagesStartedBeforeMetadata"] is True, (
+        "Atlas transcript request must start before its metadata response on a rapid switch"
+    )
 
     def _assert_atlas_wins(session_result, *, label):
         assert session_result["finalSid"] == "sid-atlas", f"{label}: stale overlap should end on Atlas session"

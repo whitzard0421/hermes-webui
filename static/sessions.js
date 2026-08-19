@@ -1837,8 +1837,20 @@ async function loadSession(sid){
   // repaired by the deferred resolver after S.session is assigned.
   // Guard against network/server failures to prevent a permanently stuck loading state.
   let data;
+  let _prefetchedMessagesOutcome=null;
   try {
-    data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
+    const _metadataRequest=api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
+    // 真正切换会话时消息区已清空，尾部窗口请求不依赖元数据响应。
+    // 现在立即发起它，避免把两次浏览器/服务器往返串行化。相同会话的
+    // force reload 仍保持串行，因为它的请求宽度依赖刷新后的 message_count
+    // 和已加载会话的窗口提示。
+    if(currentSid!==sid){
+      _prefetchedMessagesOutcome=_requestSessionMessages(sid).then(
+        prefetchedData=>({ok:true,data:prefetchedData}),
+        error=>({ok:false,error})
+      );
+    }
+    data = await _metadataRequest;
   } catch(e) {
     const profileMismatch=_sessionProfileMismatchFromError(e);
     if(profileMismatch && profileMismatch.profile && !opts.skipProfileResolve){
@@ -2120,7 +2132,7 @@ async function loadSession(sid){
     // this session's INFLIGHT snapshot, not leave prior-session rows in place.
     if(typeof clearLiveToolCards==='function') clearLiveToolCards();
     try {
-      await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration});
+      await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration, prefetchedMessagesOutcome:_prefetchedMessagesOutcome});
     } catch(e) {
       if (!_isCurrentLoad()) {
         _rearmActiveSessionStream();
@@ -2226,7 +2238,7 @@ async function loadSession(sid){
     // "messages already populated" early-return inside _ensureMessagesLoaded
     // does NOT skip the swap to the new transcript.
     try {
-      await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration});
+      await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration, prefetchedMessagesOutcome:_prefetchedMessagesOutcome});
     } catch (e) {
       if (!_isCurrentLoad()) {
         _rearmActiveSessionStream();
@@ -3125,6 +3137,20 @@ function _syncToolCallsForLoadedMessages(messages, sessionToolCalls){
   }
 }
 
+async function _requestSessionMessages(sid) {
+  // 请求尾部窗口以加快首次加载；相同会话的 force reload 可通过窗口提示
+  // 扩大该范围，或省略限制以请求完整 transcript。
+  const reloadLimit = _messageReloadLimitForSession(sid);
+  const boundedReloadLimit = (reloadLimit && reloadLimit <= _msgLimitMax) ? reloadLimit : null;
+  const reloadLimitParam = boundedReloadLimit ? `&msg_limit=${boundedReloadLimit}` : '';
+  // 保留该兼容参数，以支持前后端版本不完全一致的部署。
+  const expandParam = boundedReloadLimit ? '&expand_renderable=1' : '';
+  return api(
+    `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0${reloadLimitParam}${expandParam}`,
+    {timeoutMs:120000}
+  );
+}
+
 async function _ensureMessagesLoaded(sid, opts) {
   // `opts` is an explicit named parameter (vs loadSession's arguments[1]
   // pattern) because _ensureMessagesLoaded is a module-private helper: it is
@@ -3146,27 +3172,15 @@ async function _ensureMessagesLoaded(sid, opts) {
     _clearSameSessionForceReloadHint(sid);
     return;
   }
-  // Fetch session messages with a tail window for fast initial load.
-  const reloadLimit = _messageReloadLimitForSession(sid); // defaults to _INITIAL_MSG_LIMIT
-  // A reload window above the server's msg_limit ceiling would be clamped by
-  // the backend (returning only the last _MSG_LIMIT_MAX rows), which can
-  // silently SHRINK an already-loaded transcript that had more than the ceiling
-  // of rows visible (rows 400–999 replaced by 500–999). When the requested
-  // window exceeds the ceiling, fall back to the bare full-transcript request
-  // (no msg_limit / no expand_renderable) so a same-session refresh never drops
-  // already-loaded older rows (Codex gate #6154, silent row-loss).
-  const boundedReloadLimit = (reloadLimit && reloadLimit <= _msgLimitMax) ? reloadLimit : null;
-  const reloadLimitParam = boundedReloadLimit ? `&msg_limit=${boundedReloadLimit}` : '';
-  // Older frontends used expand_renderable=1 to request visible-row expansion.
-  // The server now counts msg_limit by visible transcript rows by default; keep
-  // the flag for compatibility with mixed-version deployments.
-  const expandParam = boundedReloadLimit ? '&expand_renderable=1' : '';
   let data;
   try {
-    data = await api(
-      `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0${reloadLimitParam}${expandParam}`,
-      {timeoutMs:120000}
-    );
+    if(opts.prefetchedMessagesOutcome){
+      const outcome=await opts.prefetchedMessagesOutcome;
+      if(!outcome.ok) throw outcome.error;
+      data=outcome.data;
+    }else{
+      data=await _requestSessionMessages(sid);
+    }
   } finally {
     if (_ownsLoad()) _clearSameSessionForceReloadHint(sid);
   }
