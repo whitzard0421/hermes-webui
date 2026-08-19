@@ -179,7 +179,7 @@ _DASHBOARD_LINK_DRIVER = textwrap.dedent(
         result.statusCalls += 1;
         return Promise.resolve({
           running: modeEl.value !== 'never',
-          browser_url: modeEl.value === 'never' ? '' : 'http://127.0.0.1:1234',
+          browser_url: modeEl.value === 'never' ? '' : (urlEl.value || 'http://127.0.0.1:1234'),
         });
       }
       return Promise.resolve({ running: false });
@@ -192,7 +192,7 @@ _DASHBOARD_LINK_DRIVER = textwrap.dedent(
     for (const name of ['_normalizeDashboardEnabledMode','_setDashboardModeForChip','_getDashboardChipRestoreMode']) {
       eval(extractFn(uiSrc, name));
     }
-    for (const name of ['_dashboardBrowserUrl', '_applyDashboardStatus', 'refreshDashboardStatus', 'loadDashboardSettings', 'saveDashboardSettings']) {
+    for (const name of ['_dashboardUrlIsLoopback', '_dashboardBrowserUrl', '_applyDashboardStatus', 'refreshDashboardStatus', 'loadDashboardSettings', 'saveDashboardSettings']) {
       let src = extractFn(uiSrc, name);
       if(name === 'saveDashboardSettings'){
         src = src.replace(
@@ -211,8 +211,9 @@ _DASHBOARD_LINK_DRIVER = textwrap.dedent(
         id: btn.id,
         classes: Array.from(btn.classList._set || []),
         display: btn.style.display || '',
-        dashboardUrl: btn._attrs['data-dashboard-url'] || '',
+        dashboardUrl: btn.dataset.dashboardUrl || '',
         tooltip: btn._attrs['data-tooltip'] || '',
+        ariaLabel: btn._attrs['aria-label'] || '',
       }));
     }
 
@@ -375,6 +376,21 @@ def test_dashboard_loopback_warning_and_external_badge_are_present():
     assert "dashboard-external-badge" in INDEX_HTML
     assert ".dashboard-external-badge" in STYLE_CSS
     assert "dashboard-link-visible" in STYLE_CSS
+
+
+@requires_node
+def test_public_dashboard_url_does_not_show_loopback_warning():
+    out = _run_dashboard_link_driver("save", mode="always", url="https://dashboard.example.com")
+
+    assert all(state["ariaLabel"] == "Dashboard" for state in out["buttonStates"])
+    assert all(state["dashboardUrl"] == "https://dashboard.example.com" for state in out["buttonStates"])
+
+
+@requires_node
+def test_loopback_dashboard_url_warns_on_public_webui():
+    out = _run_dashboard_link_driver("save", mode="always", url="http://127.0.0.1:9119")
+
+    assert all(state["ariaLabel"] == "Loopback" for state in out["buttonStates"])
 
 
 def test_dashboard_settings_controls_live_in_system_panel():
