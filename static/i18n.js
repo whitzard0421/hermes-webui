@@ -1167,6 +1167,8 @@ const LOCALES = {
     workspace_desc: 'Add and switch workspaces for your sessions.',
     session_meta_messages: (n) => `${n} msg${n === 1 ? '' : 's'}`,
     session_meta_children: (n) => `${n} child${n === 1 ? '' : 'ren'}`,
+    session_background_activity: (n) => `Background activity (${n})`,
+    session_background_activity_hint: 'Tool and automation runs. Expand when you need diagnostic context.',
     // Softened label: avoids exposing the technical internal term
     // 'segment' in the default visible badge. User-facing copy remains
     // translatable for locales that prefer a different wording. (#2155)
@@ -11246,6 +11248,8 @@ const LOCALES = {
     workspace_desc: '为你的会话添加并切换工作区。',
     session_meta_messages: (n) => `${n} 条消息`,
     session_meta_children: (n) => `${n} 子会话`,
+    session_background_activity: (n) => `后台活动 (${n})`,
+    session_background_activity_hint: '工具与自动化运行记录，需要诊断上下文时可展开查看。',
     session_meta_segments: (n) => `${n} 段`,
     session_lineage_toggle_hint: '{0} — 较早的上下文轮次已折叠在这里。点击显示或隐藏。',
     session_lineage_static_hint: '{0} — 较早的上下文轮次已折叠在这里。',
@@ -13291,6 +13295,8 @@ const LOCALES = {
     workspace_desc: '新增工作區，並為對話切換工作區。',
     session_meta_messages: (n) => `${n} 則訊息`,
     session_meta_children: (n) => `${n} 則子`,
+    session_background_activity: (n) => `背景活動 (${n})`,
+    session_background_activity_hint: '工具與自動化執行記錄，需要診斷脈絡時可展開查看。',
     // Softened label: avoids exposing the technical internal term
     // 'segment' in the default visible badge. User-facing copy remains
     // translatable for locales that prefer a different wording. (#2155)

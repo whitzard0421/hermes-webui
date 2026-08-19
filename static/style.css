@@ -1828,6 +1828,10 @@
   .session-date-header{display:flex;align-items:center;gap:5px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);padding:8px 10px 4px;cursor:pointer;user-select:none;opacity:.8;transition:opacity .15s;}
   .session-date-header:hover{opacity:1;}
   .session-date-header.pinned{color:var(--accent);}
+  .session-date-group.background-activity{margin-top:6px;padding-top:2px;border-top:1px solid var(--border2);}
+  .session-date-header.background-activity{font-size:11px;font-weight:600;text-transform:none;letter-spacing:0;opacity:.68;}
+  .session-date-header.background-activity:hover{opacity:.92;}
+  .session-item.background-session:not(.active):not(.needs-attention){opacity:.78;}
 
   /* ── Batch select mode ── */
   .session-select-toggle{font-size:11px;padding:6px 10px;color:var(--muted);cursor:pointer;text-align:center;opacity:.6;transition:opacity .15s;user-select:none;margin-top:4px;border-radius:6px;}

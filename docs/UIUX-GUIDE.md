@@ -43,6 +43,13 @@ Prefer:
 - progressive disclosure for debugging detail,
 - legible text over decorative chrome.
 
+Background activity sessions (tool, Kanban, cron, webhook, and gateway runs)
+are grouped into one collapsed sidebar disclosure after the regular date-based
+conversation groups. The group keeps source labels and remains searchable;
+opening the active session or a session that needs approval/clarification opens
+the group automatically. This keeps diagnostic history reachable without making
+automated runs compete visually with user conversations.
+
 Avoid turning the interface into a demo page of colorful cards. Errors,
 approvals, and other action-required states may be prominent because the user
 must notice and respond to them.

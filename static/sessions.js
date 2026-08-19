@@ -2520,6 +2520,20 @@ function _sourceKeyForSession(session) {
   return (session && (session.raw_source || session.source_tag || session.source || '') || '').toLowerCase();
 }
 
+function _isBackgroundSidebarSession(session) {
+  if (!session) return false;
+  const backgroundSources = new Set(['tool', 'kanban', 'cron', 'webhook', 'api', 'api_server']);
+  const normalizedSource=String(session.session_source||'').trim().toLowerCase();
+  if(backgroundSources.has(normalizedSource)) return true;
+  if(['webui','cli','messaging','fork','subagent'].includes(normalizedSource)) return false;
+  const legacySources = [
+    session.raw_source,
+    session.source_tag,
+    session.source,
+  ].map(value => String(value || '').trim().toLowerCase());
+  return legacySources.some(source => backgroundSources.has(source));
+}
+
 function _isCliSession(session) {
   if (!session) return false;
   // session_source is set by upstream normalization for CLI sessions as 'cli'
@@ -7585,6 +7599,51 @@ function _renderSidebarRowsFromRawSessions(sessionsRaw, referenceSessionsRaw){
   return _attachChildSessionsToSidebarRows(_collapseSessionLineageForSidebar(sessionsRaw), sessionsRaw, referenceRows);
 }
 
+const BACKGROUND_ACTIVITY_GROUP_KEY='__background_activity__';
+
+function _buildSidebarSessionGroups(orderedSessions, now){
+  const background=[];
+  const foreground=[];
+  for(const session of orderedSessions){
+    if(_isBackgroundSidebarSession(session)) background.push(session);
+    else foreground.push(session);
+  }
+  const pinned=foreground.filter(session=>session.pinned);
+  const unpinned=foreground.filter(session=>!session.pinned);
+  const groups=[];
+  let currentLabel=null;
+  let currentItems=[];
+  if(pinned.length) groups.push({label:'\u2605 Pinned',items:pinned,isPinned:true});
+  for(const session of unpinned){
+    const label=_sessionTimeBucketLabel(_sessionSortTimestampMs(session),now);
+    if(label!==currentLabel){
+      if(currentItems.length) groups.push({label:currentLabel,items:currentItems});
+      currentLabel=label;
+      currentItems=[session];
+    }else{
+      currentItems.push(session);
+    }
+  }
+  if(currentItems.length) groups.push({label:currentLabel,items:currentItems});
+  if(background.length){
+    groups.push({
+      label:t('session_background_activity',background.length),
+      items:background,
+      isBackground:true,
+      collapseKey:BACKGROUND_ACTIVITY_GROUP_KEY,
+    });
+  }
+  return groups;
+}
+
+function _isSidebarGroupCollapsed(group, collapsedState, autoOpenBackground=false){
+  const state=collapsedState&&typeof collapsedState==='object'?collapsedState:{};
+  const key=group&&group.collapseKey||group&&group.label||'';
+  if(group&&group.isBackground&&autoOpenBackground) return false;
+  if(Object.prototype.hasOwnProperty.call(state,key)) return Boolean(state[key]);
+  return Boolean(group&&group.isBackground);
+}
+
 function _attachProjectQuickCreateButton(chip, project){
   const btn=document.createElement('button');
   btn.type='button';
@@ -7897,31 +7956,27 @@ function renderSessionListFromCache(){
     list.appendChild(empty);
   }
   const orderedSessions=[...sessions].sort(_sessionSidebarSortCompare);
-  // Separate pinned from unpinned
-  const pinned=orderedSessions.filter(s=>s.pinned);
-  const unpinned=orderedSessions.filter(s=>!s.pinned);
-  // Date grouping: Pinned / Today / Yesterday / This week / Last week / Older
+  // Date grouping for conversations, followed by one quiet background-activity
+  // disclosure for tool and automation runs.
   const now=_serverNowMs();
   // Collapse state persisted in localStorage
   let _groupCollapsed={};
   try{_groupCollapsed=JSON.parse(localStorage.getItem('hermes-date-groups-collapsed')||'{}');}catch(e){}
   const _saveCollapsed=()=>{try{localStorage.setItem('hermes-date-groups-collapsed',JSON.stringify(_groupCollapsed));}catch(e){}};
-  // Group sessions by date
-  const groups=[];
-  let curLabel=null,curItems=[];
-  if(pinned.length) groups.push({label:'\u2605 Pinned',items:pinned,isPinned:true});
-  for(const s of unpinned){
-    const ts=_sessionSortTimestampMs(s);
-    const label=_sessionTimeBucketLabel(ts, now);
-    if(label!==curLabel){
-      if(curItems.length) groups.push({label:curLabel,items:curItems});
-      curLabel=label;curItems=[s];
-    } else { curItems.push(s); }
-  }
-  if(curItems.length) groups.push({label:curLabel,items:curItems});
+  const groups=_buildSidebarSessionGroups(orderedSessions,now);
+  const _backgroundGroupAutoOpen=(group)=>Boolean(
+    group&&group.isBackground&&group.items.some(session=>(
+      _sessionLineageContainsSession(session,activeSidForSidebar)||
+      _sessionAttentionState(session)
+    ))
+  );
+  const _groupIsCollapsed=(group)=>{
+    if(group&&group.isBackground&&searchQueryRaw) return false;
+    return _isSidebarGroupCollapsed(group,_groupCollapsed,_backgroundGroupAutoOpen(group));
+  };
   const flatSessionRows=[];
   for(const g of groups){
-    if(_groupCollapsed[g.label]) continue;
+    if(_groupIsCollapsed(g)) continue;
     for(const s of g.items){ flatSessionRows.push({group:g,session:s}); }
   }
   _sessionVisibleSidebarIds=flatSessionRows.map(row=>row.session&&row.session.session_id).filter(Boolean);
@@ -7981,9 +8036,10 @@ function renderSessionListFromCache(){
   let globalSessionRowIndex=0;
   for(const g of groups){
     const wrapper=document.createElement('div');
-    wrapper.className='session-date-group';
+    wrapper.className='session-date-group'+(g.isBackground?' background-activity':'');
     const hdr=document.createElement('div');
-    hdr.className='session-date-header'+(g.isPinned?' pinned':'');
+    hdr.className='session-date-header'+(g.isPinned?' pinned':'')+(g.isBackground?' background-activity':'');
+    if(g.isBackground) hdr.title=t('session_background_activity_hint');
     const caret=document.createElement('span');
     caret.className='session-date-caret';
     caret.textContent='\u25BE'; // down when expanded; rotated right when collapsed
@@ -7992,13 +8048,14 @@ function renderSessionListFromCache(){
     hdr.appendChild(caret);hdr.appendChild(label);
     const body=document.createElement('div');
     body.className='session-date-body';
-    const isGroupCollapsed=Boolean(_groupCollapsed[g.label]);
+    const collapseKey=g.collapseKey||g.label;
+    const isGroupCollapsed=_groupIsCollapsed(g);
     if(isGroupCollapsed){body.style.display='none';caret.classList.add('collapsed');}
     hdr.onclick=()=>{
       const isCollapsed=body.style.display==='none';
       body.style.display=isCollapsed?'':'none';
       caret.classList.toggle('collapsed',!isCollapsed);
-      _groupCollapsed[g.label]=!isCollapsed;
+      _groupCollapsed[collapseKey]=!isCollapsed;
       _saveCollapsed();
       renderSessionListFromCache();
     };
@@ -8076,6 +8133,7 @@ function renderSessionListFromCache(){
     const attention=_sessionAttentionState(s)||_sessionAttentionState({_child:true,attention:s._child_session_attention});
     const attentionClass=attention?(attention.kind==='approval'?' attention-approval':(attention.kind==='clarify'?' attention-clarify':' attention-attention')):'';
     const readOnly=_isReadOnlySession(s);
+    const isBackgroundSession=_isBackgroundSidebarSession(s);
     el.className='session-item'+(isActive?' active':'')+(isActive&&S.session&&S.session._flash?' new-flash':'')+(s.archived?' archived':'')+(ownStreaming?' streaming':'')+(hasUnread?' unread':'')+(attention?' needs-attention':'')+attentionClass;
     const swipeReturnOffset=_sessionSwipeReturnOffsets.get(s.session_id);
     if(swipeReturnOffset!==undefined){
@@ -8094,6 +8152,11 @@ function renderSessionListFromCache(){
       el.classList.add('cli-session');
       el.dataset.source=_getChannelLabel(s)||'CLI';
       el.dataset.sourceKey=_sourceKeyForSession(s)||'cli';
+    }
+    if(isBackgroundSession){
+      el.classList.add('background-session');
+      el.dataset.source=_getChannelLabel(s)||'Agent';
+      el.dataset.sourceKey=_sourceKeyForSession(s)||'agent';
     }
     if(readOnly) el.classList.add('read-only-session');
     if(isActive&&S.session&&S.session._flash)delete S.session._flash;
@@ -8230,7 +8293,7 @@ function renderSessionListFromCache(){
       };
       titleRow.appendChild(childCountEl);
     }
-    if(s.is_cli_session||_isMessagingSession(s)){
+    if(s.is_cli_session||_isMessagingSession(s)||isBackgroundSession){
       const chipLabel=_getChannelLabel(s)||'CLI';
       const chip=document.createElement('span');
       chip.className='session-source-chip';
@@ -8251,7 +8314,7 @@ function renderSessionListFromCache(){
       const modelMeta=_formatSessionModelWithGateway(s);
       if(modelMeta) metaBits.push(modelMeta);
       const sourceLabel=_getChannelLabel(s);
-      if(sourceLabel&&(s.is_cli_session||_isMessagingSession(s))) metaBits.push(sourceLabel);
+      if(sourceLabel&&(s.is_cli_session||_isMessagingSession(s)||isBackgroundSession)) metaBits.push(sourceLabel);
       if(readOnly) metaBits.push('read-only');
       if(_showAllProfiles&&s.profile) metaBits.push(s.profile);
       const meta=document.createElement('div');
